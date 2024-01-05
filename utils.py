@@ -19,6 +19,7 @@ from typing_extensions import (
 %load_ext autoreload
 %autoreload 2
 '''
+from backtest.preprocessors.preprocess import LobFeatureEngineering
 
 
 def init():
@@ -330,12 +331,41 @@ def get_basic_info(codes, fields='ths_stock_short_name_stock;ths_corp_nature_sto
     return get_THS_BD(codes, fields, f';{date};100,{date}').data
 
 
-def plot_legend_outside(df, save_path=None, baseline: Union[pd.Series, pd.DataFrame] = None, linewidth=0.8,
-                        xticks: Union[list, np.array] = None):
+def plot_legend_outside(df: Union[pd.Series, pd.DataFrame, np.ndarray], save_path=None,
+                        baseline: Union[pd.Series, pd.DataFrame] = None, linewidth=0.8,
+                        xticks: Union[list, np.array] = None, shrink: Union[bool, int] = 1000,
+                        plot_uniform_timestamp=True):
+    """将legend放到图片外部
+
+    Parameters
+    ----------
+    df :
+    save_path :
+        若非nan则会保存该图片
+    baseline :
+        基准benchmark
+    linewidth :
+    xticks : deprecated
+        用来减少横轴显示的时间戳
+    shrink : bool or int,
+        if int, 将df缩减到shrink行。 if True, 缩放到最多10000行
+    plot_uniform_timestamp : bool,
+        将时间戳视为均匀的点，而不是按照时间戳的间隔来画图。设置为true可以跳过午盘。该参数能大幅提高画图效率
+
+    Returns
+    -------
+
     """
-    将legend放到图片外部
-    save_path: 若非nan则会保存该图片
-    """
+    if isinstance(df, pd.Series): df = df.to_frame()
+    df.index = df.index.astype(str)
+
+    # 如果数据太多，直接舍弃部分df数据来画图，保证整幅图片总共数据点
+    if shrink:  # True/int
+        steps = min(len(df), 10000)
+        if not isinstance(shrink, bool):
+            steps = min(len(df), shrink)
+        step = len(df) // steps
+        df = df.iloc[::step]
 
     for col in df.columns:
         plt.plot(df.index, df[col], label=col, linewidth=linewidth)
@@ -350,7 +380,16 @@ def plot_legend_outside(df, save_path=None, baseline: Union[pd.Series, pd.DataFr
         length = len(xticks)
         if length > 50:
             steps = 10
-            step = int(length / steps)
+            step = length // steps
+            plt.xticks(range(0, length, step), xticks[::step], rotation=70)
+        else:
+            plt.xticks(range(length), xticks)
+    if plot_uniform_timestamp:
+        xticks = df.index
+        length = len(xticks)
+        if length > 50:
+            steps = 10
+            step = length // steps
             plt.xticks(range(0, length, step), xticks[::step], rotation=70)
         else:
             plt.xticks(range(length), xticks)
@@ -456,7 +495,7 @@ def calc_rv(df, window=10):
 
 
 def calc_date2maturity(current: Union[str, datetime, np.datetime64], expiry: Union[str, datetime, np.datetime64],
-                       trading_dates: Union[np.ndarray, List[str]] = None):
+                       trading_dates: Union[np.ndarray, List[str]] = None,including_right=False):
     """用于计算current距离expiry在中国交易日历中的天数
 
     Parameters
@@ -467,6 +506,8 @@ def calc_date2maturity(current: Union[str, datetime, np.datetime64], expiry: Uni
         到期日
     trading_dates : np.ndarray,
         预先存成csv的数据。`trading_dates_cn_2000-01-01_2024-12-31.csv`
+    including_right : bool,
+        是否包括右边界。if True，expiry指代expiry当天15：00; if False, expiry指代expiry前一天15：00
 
     Returns
     -------
@@ -488,11 +529,14 @@ def calc_date2maturity(current: Union[str, datetime, np.datetime64], expiry: Uni
 
     idx_curr = np.argwhere(trading_dates == current)[0][0]
     idx_exp = np.argwhere(trading_dates == expiry)[0][0]
-    return idx_exp - idx_curr
+    res=idx_exp - idx_curr
+    if not including_right:
+        res-=1
+    return res
 
 
 def calc_time2maturity(current: Union[pd.DatetimeIndex, pd.Series], expiry: Union[pd.DatetimeIndex], days2maturity=None,
-                       annualized=240):
+                       annualized=244):
     """
 
     Parameters
@@ -530,6 +574,52 @@ def calc_time2maturity(current: Union[pd.DatetimeIndex, pd.Series], expiry: Unio
             time2maturity /= annualized
         time2maturity = np.where(time2maturity < 1e-3, 1e-3,
                                  time2maturity)  # For small TTEs, use a small value (1e-3).即最后一小时的TTM都视为1h
+        time2maturity = pd.Series(time2maturity, index=current, name='time2maturity')
         return time2maturity
     else:
         raise NotImplementedError()
+
+
+def calc_effective_price(fe:LobFeatureEngineering, df, method='wap', level=1):
+    """计算期权有效价格
+
+    Parameters
+    ----------
+    fe : LobFeatureEngineering
+    df :
+    method :
+
+    Returns
+    -------
+
+    """
+    res = pd.DataFrame()
+    if method == 'wap':
+        for i in range(1, level + 1):
+            res = pd.concat([res, fe.calc_wap(df, level=i, cross=True)], axis=1)
+    elif method == 'cum_vol_wap':
+        res = fe.calc_cum_vol_wap(df, cum_level=level, cross=True)
+    elif method == 'cum_wap':
+        res = fe.calc_cum_wap(df, level=level, cross=True)
+    res.index=pd.to_datetime(res.index)
+    return res
+
+
+from py_vollib_vectorized.implied_volatility import vectorized_implied_volatility
+from py_vollib_vectorized.greeks import delta, gamma, vega, theta, rho
+
+
+def calc_iv_greeks(price, S, K, t, r, flag, q, calc_greeks=True, index=None):
+    iv = vectorized_implied_volatility(price=price, S=S, K=K, t=t, r=r, flag=flag, q=q,on_error='ignore').replace(0,np.nan)
+    res=iv
+    if calc_greeks:
+        option_delta = delta(flag=flag, S=S, K=K, t=t, r=r, sigma=iv, q=q)
+        option_gamma = gamma(flag=flag, S=S, K=K, t=t, r=r, sigma=iv, q=q)
+        option_vega = vega(flag=flag, S=S, K=K, t=t, r=r, sigma=iv, q=q)
+        option_theta = theta(flag=flag, S=S, K=K, t=t, r=r, sigma=iv, q=q)
+        option_rho = rho(flag=flag, S=S, K=K, t=t, r=r, sigma=iv, q=q)
+        res = pd.concat([iv, option_delta, option_gamma, option_vega, option_theta, option_rho], axis=1)
+    if index is not None:
+        res.index=index
+    res.index = pd.to_datetime(res.index)
+    return res
