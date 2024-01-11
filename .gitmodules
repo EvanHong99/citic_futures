@@ -1,3 +1,6 @@
 [submodule "20231226bid-ask-spread/backtest"]
 	path = 20231226bid-ask-spread/backtest
 	url = https://github.com/EvanHong99/backtest.git
+[submodule "financial_derivatives"]
+	path = financial_derivatives
+	url = https://github.com/EvanHong99/financial_derivatives.git
